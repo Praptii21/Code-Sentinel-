@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { Nav } from "@/components/nav";
-import { API_BASE_URL } from "@/utils/api";
+import { apiFetch } from "@/utils/api";
 
 interface AnalyticsData {
   totalRequests: number;
@@ -40,7 +40,7 @@ export default function AnalyticsPage() {
   async function fetchAnalytics() {
     setLoading(true);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/analytics`);
+      const resp = await apiFetch("/api/analytics");
       if (!resp.ok) throw new Error("Failed to fetch analytics");
       const d = await resp.json();
       setData(d);
