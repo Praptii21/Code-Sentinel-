@@ -6,7 +6,7 @@ pydantic
 python-multipart
 google-genai
 passlib
-bcrypt
+bcrypt==3.2.2
 email-validator
 slowapi
 limits
