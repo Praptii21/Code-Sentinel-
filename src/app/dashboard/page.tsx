@@ -8,7 +8,7 @@ import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import dynamic from "next/dynamic";
 import { Nav } from "@/components/nav";
-import { API_BASE_URL } from "@/utils/api";
+import { apiFetch } from "@/utils/api";
 
 const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 
@@ -181,7 +181,7 @@ export default function DashboardPage() {
     if (activeTab !== "repo" && code.length > MAX_PASTE_CHARS) return setScanError(`Exceeds ${MAX_PASTE_CHARS} char limit.`);
     setLoadingScan(true); setScanError(null); setResults(null); setFixedVulnIds([]);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/scan`, {
+      const res = await apiFetch("/api/scan", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: payload }),
       });
@@ -247,7 +247,7 @@ export default function DashboardPage() {
     setChatHistory(prev => [...prev, { role: "user", text }]);
     setLoadingChat(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/process`, {
+      const res = await apiFetch("/process", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: text }),
       });
@@ -317,7 +317,7 @@ export default function DashboardPage() {
     setApplyingFixId(vuln.id);
     setScanError(null);
     try {
-      const res = await fetch(`${API_BASE_URL}/api/fix`, {
+      const res = await apiFetch("/api/fix", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
