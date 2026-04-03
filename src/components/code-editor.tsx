@@ -5,7 +5,7 @@ import dynamic from "next/dynamic";
 import { motion, AnimatePresence } from "framer-motion";
 import { Play, Cpu, Zap, Upload } from "lucide-react";
 import { getMockAnalysis, SAMPLE_CODE, type AnalysisResult } from "@/lib/mock-analysis";
-import { API_BASE_URL } from "@/utils/api";
+import { apiFetch } from "@/utils/api";
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
   ssr: false,
@@ -36,7 +36,7 @@ export function CodeEditor({ onResult }: Props) {
 
   // Fetch available samples from backend on mount
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/samples`)
+    apiFetch("/api/samples")
       .then(r => r.json())
       .then(data => setSamples(data.samples || []))
       .catch(e => console.warn("Failed to fetch samples:", e));
@@ -44,7 +44,7 @@ export function CodeEditor({ onResult }: Props) {
 
   async function handleLoadSample(name: string) {
     try {
-      const r = await fetch(`${API_BASE_URL}/api/sample/${name}`);
+      const r = await apiFetch(`/api/sample/${name}`);
       const data = await r.json();
       setCode(data.content);
       editorRef.current = data.content;
@@ -70,7 +70,7 @@ export function CodeEditor({ onResult }: Props) {
     setResult(null);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/scan`, {
+      const response = await apiFetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: editorRef.current }),
