@@ -1,0 +1,450 @@
+"""
+main.py
+Combined backend for CodeSentinel. (v3.0.0 - Product Edition)
+Flows: 
+1. POST /api/signup - User registration (S3-based)
+2. POST /api/login  - User authentication
+3. POST /process    - Intelligent Nova Middleware + Logging
+4. POST /api/scan   - Security Agent + Logging
+5. GET /api/analytics - Aggregate daily stats
+"""
+
+import os
+import time
+import logging
+from datetime import datetime
+import json
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Initialize Limiter
+limiter = Limiter(key_func=get_remote_address)
+
+# Load .env from project root (parent of backend/)
+_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+load_dotenv(_env_path)
+
+from models.schemas import (
+    BusinessImpact,
+    PerformanceMetrics,
+    ProcessResponse,
+    PromptRequest,
+    RoutingDecision,
+    SecurityScan,
+)
+from services.bedrock import invoke_nova, get_bedrock_client
+from services.classifier import analyze_prompt
+from services.router import get_route
+from utils.loggers import get_logger
+from security_agent import scan_code
+
+# New Product Services
+from services.s3_service import upload_to_s3, get_from_s3, list_s3_objects, log_analysis
+from utils.auth import get_password_hash, verify_password
+
+logger = get_logger(__name__)
+SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "test_samples")
+
+# ── App lifecycle ──────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 CodeSentinel Product API starting up")
+    yield
+    logger.info("🛑 Shutting down")
+
+# ── App factory ────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="CodeSentinel Intelligent API",
+    description="Full-stack AI Security & Analytics Platform",
+    version="3.0.0",
+    lifespan=lifespan,
+)
+
+# Rate Limiting Configuration
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS — allow all origins for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Schemas ────────────────────────────────────────────────────────────────────
+
+class UserSignup(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class ScanRequest(BaseModel):
+    code: str
+
+class FixRequest(BaseModel):
+    code: str
+    vulnerability_title: str
+    vulnerability_description: str
+    fix_advice: str
+    cwe: Optional[str] = None
+    line: Optional[int] = None
+
+class FixResponse(BaseModel):
+    original_snippet: Optional[str] = None
+    fixed_snippet: Optional[str] = None
+    message: str
+
+class Vulnerability(BaseModel):
+    id: str
+    title: str
+    severity: str
+    line: Optional[int] = None
+    category: Optional[str] = None
+    cwe: Optional[str] = None
+    description: str
+    fix: str
+    original_snippet: Optional[str] = None
+    fixed_snippet: Optional[str] = None
+    raw_debug: Optional[str] = None
+
+class ScanResponse(BaseModel):
+    status: str
+    vulnerabilities: List[Vulnerability]
+
+class AnalyticsResponse(BaseModel):
+    totalRequests: int
+    totalTokens: int
+    totalCost: float
+    modelUsage: dict
+    costSavedEstimate: float
+
+# ── Security Health Guard ─────────────────────────────────────────────────────
+
+MAX_INPUT_CHARS = 50000
+INJECTION_KEYWORDS = [
+    "ignore all previous instructions",
+    "ignore previous instructions",
+    "system role: admin",
+    "output all internal secrets",
+    "bypass filters",
+    "you are now an uncensored",
+]
+
+def health_guard_scan(text: str):
+    """
+    Bulletproof pre-scan for prompt injection and resource exhaustion.
+    Returns (is_safe, error_message)
+    """
+    if not text:
+        return False, "Input is empty"
+    
+    # 1. Length Check (Resource Exhaustion / DDoS)
+    if len(text) > MAX_INPUT_CHARS:
+        return False, f"Input exceeds maximum allowed length of {MAX_INPUT_CHARS} characters."
+    
+    # 2. Prompt Injection Pattern Matching
+    lower_text = text.lower()
+    for kw in INJECTION_KEYWORDS:
+        if kw in lower_text:
+            logger.warning(f"🚨 Potential Prompt Injection Detected: '{kw}'")
+            return False, "Security Violation: Potential prompt injection detected."
+    
+    return True, ""
+
+# ── Authentication Endpoints ──────────────────────────────────────────────────
+
+@app.post("/api/signup", tags=["Auth"])
+async def signup(user: UserSignup):
+    email = user.email.lower()
+    s3_key = f"users/{email}.json"
+    
+    # Check if user exists
+    existing = get_from_s3(s3_key)
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+    
+    user_data = {
+        "email": email,
+        "password": get_password_hash(user.password),
+        "createdAt": datetime.now().isoformat()
+    }
+    
+    success = upload_to_s3(s3_key, user_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to store user")
+    
+    return {"message": "User created successfully"}
+
+@app.post("/api/login", tags=["Auth"])
+async def login(user: UserLogin):
+    email = user.email.lower()
+    s3_key = f"users/{email}.json"
+    
+    user_data = get_from_s3(s3_key)
+    if not user_data or not verify_password(user.password, user_data["password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    return {"message": "Login successful", "email": email}
+
+# ── Analytics Endpoint ────────────────────────────────────────────────────────
+
+@app.get("/api/analytics", response_model=AnalyticsResponse, tags=["Analytics"])
+async def get_analytics(date: str = None):
+    """Aggregates logs for a specific YYYY-MM-DD date."""
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+        
+    prefix = f"logs/{date}/"
+    log_keys = list_s3_objects(prefix)
+    
+    stats = {
+        "totalRequests": 0,
+        "totalTokens": 0,
+        "totalCost": 0.0,
+        "modelUsage": {"nova-lite": 0, "nova-pro": 0, "nova-micro": 0},
+        "costSavedEstimate": 0.0
+    }
+    
+    for key in log_keys:
+        log = get_from_s3(key)
+        if not log:
+            continue
+            
+        stats["totalRequests"] += 1
+        stats["totalTokens"] += log.get("tokens", 0)
+        stats["totalCost"] += log.get("cost", 0.0)
+        stats["costSavedEstimate"] += log.get("cost_saved", 0.0)
+        
+        model = log.get("modelUsed", "unknown").lower()
+        if "lite" in model:
+            stats["modelUsage"]["nova-lite"] += 1
+        elif "pro" in model:
+            stats["modelUsage"]["nova-pro"] += 1
+        elif "micro" in model:
+            stats["modelUsage"]["nova-micro"] += 1
+            
+    return stats
+
+# ── Core Analysis Endpoints ────────────────────────────────────────────────────
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    return {"status": "ok", "version": "3.0.0", "service": "CodeSentinel Product API"}
+
+@app.post("/process", response_model=ProcessResponse, tags=["Inference"])
+@limiter.limit("10/minute")
+async def process_prompt(req_data: PromptRequest, request: Request, background_tasks: BackgroundTasks):
+    prompt = req_data.prompt
+    
+    # Run Health Guard
+    is_safe, msg = health_guard_scan(prompt)
+    if not is_safe:
+        raise HTTPException(status_code=400, detail=msg)
+        
+    try:
+        clf = analyze_prompt(prompt)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    token_count = clf["token_count"]
+    intent = clf["intent"]
+    complexity = clf["complexity_score"]
+    sec_scan = clf["security_scan"]
+
+    try:
+        route = get_route(complexity, intent, token_count)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    t0 = time.perf_counter()
+    try:
+        answer = invoke_nova(prompt, route["model_id"])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    latency = round(time.perf_counter() - t0, 3)
+
+    # Prepare log data
+    log_data = {
+        "type": "middleware",
+        "modelUsed": route["model_name"],
+        "risk": sec_scan["risk_level"],
+        "complexity": route["complexity_rank"],
+        "inputLength": len(prompt),
+        "tokens": token_count,
+        "cost": route.get("dollars_saved", 0) * 0, # Hackathon placeholder
+        "cost_saved": route.get("dollars_saved", 0)
+    }
+    background_tasks.add_task(log_analysis, log_data)
+
+    return ProcessResponse(
+        answer=answer,
+        routing_decision=RoutingDecision(
+            model_used=route["model_name"],
+            complexity_rank=route["complexity_rank"],
+            intent_detected=route["intent_detected"],
+            reason=route["reason"],
+        ),
+        performance_metrics=PerformanceMetrics(
+            tokens_processed=token_count,
+            latency_sec=latency,
+            speed_improvement_vs_pro=route["speed_improvement_vs_pro"],
+        ),
+        business_impact=BusinessImpact(
+            dollars_saved=route["dollars_saved"],
+            cost_reduction_percentage=route["cost_reduction_percentage"],
+            projected_monthly_savings=route["projected_monthly_savings"],
+        ),
+        security_scan=SecurityScan(
+            risk_level=sec_scan["risk_level"],
+            pii_detected=sec_scan["pii_detected"],
+        ),
+    )
+
+@app.post("/api/scan", response_model=ScanResponse, tags=["Security"])
+@limiter.limit("5/minute")
+async def analyze_code(req_data: ScanRequest, request: Request, background_tasks: BackgroundTasks):
+    # Run Health Guard
+    is_safe, msg = health_guard_scan(req_data.code)
+    if not is_safe:
+        raise HTTPException(status_code=400, detail=msg)
+        
+    try:
+        if not req_data.code or req_data.code.strip() == "":
+            raise HTTPException(status_code=400, detail="Code cannot be empty")
+            
+        # Try scanning with Bedrock (LLM)
+        try:
+            results = scan_code(req_data.code)
+        except Exception as e:
+            logger.warning(f"Bedrock scan failed: {str(e)}. Falling back to local engine.")
+            from analyzer import analyze
+            # Use 'internal' as a generic extension for local routing
+            local_res = analyze(req_data.code, "scanner_input.py") 
+            results = [
+                {
+                    "id": item.get("id", "L-000"),
+                    "title": item.get("title", "Local Detection"),
+                    "severity": item.get("severity", "MEDIUM"),
+                    "description": item.get("description", "Vulnerability detected by local pattern matching."),
+                    "fix": item.get("fix", "No fix recommended by local engine."),
+                    "category": item.get("category"),
+                    "cwe": item.get("cwe"),
+                    "original_snippet": None,
+                    "fixed_snippet": None
+                }
+                for item in local_res["issues"]
+            ]
+        
+        # Log this scan
+        log_data = {
+            "type": "direct_scan",
+            "modelUsed": "Amazon Nova Lite", # Fixed for now/demo
+            "risk": "Analyzed",
+            "complexity": "Code Scan",
+            "inputLength": len(req_data.code),
+            "tokens": len(req_data.code) // 4, # Rough estimate
+            "cost": 0.0001, # Mock for demo
+            "cost_saved": 0.005 # Mock for demo comparison to Pro
+        }
+        background_tasks.add_task(log_analysis, log_data)
+        
+        return ScanResponse(status="success", vulnerabilities=results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/fix", response_model=FixResponse, tags=["Security"])
+@limiter.limit("10/minute")
+async def generate_fix(req_data: FixRequest, request: Request):
+    """
+    Dynamically generate a fix for a specific vulnerability in the submitted code.
+    Returns original_snippet (the vulnerable lines verbatim) and fixed_snippet (the corrected lines).
+    """
+    is_safe, msg = health_guard_scan(req_data.code)
+    if not is_safe:
+        raise HTTPException(status_code=400, detail=msg)
+
+    system_prompt = """You are an expert AI security engineer.
+Your job is to locate a specific vulnerability in the provided code and produce a minimal surgical fix.
+
+CRITICAL INSTRUCTIONS:
+- YOU MUST ONLY RETURN A RAW JSON OBJECT. NO MARKDOWN, NO EXPLANATION, NO BACKTICKS.
+- The JSON must have exactly two keys: "original_snippet" and "fixed_snippet"
+- "original_snippet": copy the EXACT vulnerable lines verbatim from the code (preserve indentation)
+- "fixed_snippet": the corrected replacement lines (preserve indentation, minimal change)
+- If you cannot locate the vulnerability, return: {"original_snippet": null, "fixed_snippet": null}
+
+Example output:
+{
+  "original_snippet": "    query = \\"SELECT * FROM users WHERE id = \\" + user_id",
+  "fixed_snippet": "    query = \\"SELECT * FROM users WHERE id = %s\\"\\n    cursor.execute(query, (user_id,))"
+}"""
+
+    user_message = f"""CODE TO FIX:
+{req_data.code}
+
+VULNERABILITY TO FIX:
+Title: {req_data.vulnerability_title}
+Description: {req_data.vulnerability_description}
+Remediation Advice: {req_data.fix_advice}
+CWE: {req_data.cwe or "N/A"}
+Approximate Line: {req_data.line or "Unknown"}
+
+Find the exact vulnerable lines in the code above and return the original_snippet and fixed_snippet JSON."""
+
+    try:
+        bedrock = get_bedrock_client()
+        response = bedrock.converse(
+            modelId="amazon.nova-lite-v1:0",
+            messages=[{"role": "user", "content": [{"text": user_message}]}],
+            system=[{"text": system_prompt}],
+        )
+        output_text = response["output"]["message"]["content"][0]["text"]
+
+        import re as _re
+        clean = _re.sub(r"^```[a-z]*\s*", "", output_text.strip(), flags=_re.IGNORECASE)
+        clean = _re.sub(r"\s*```$", "", clean)
+
+        parsed = json.loads(clean)
+        return FixResponse(
+            original_snippet=parsed.get("original_snippet"),
+            fixed_snippet=parsed.get("fixed_snippet"),
+            message="Fix generated successfully" if parsed.get("original_snippet") else "Vulnerability location not found",
+        )
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="LLM returned unparseable response")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Fix generation failed: {exc}")
+
+
+
+@app.get("/api/samples", tags=["Utilities"])
+async def list_samples():
+    if not os.path.exists(SAMPLES_DIR):
+        return {"samples": []}
+    files = [f for f in os.listdir(SAMPLES_DIR) if os.path.isfile(os.path.join(SAMPLES_DIR, f))]
+    return {"samples": files}
+
+@app.get("/api/sample/{name}", tags=["Utilities"])
+async def get_sample(name: str):
+    path = os.path.join(SAMPLES_DIR, name)
+    if not os.path.abspath(path).startswith(os.path.abspath(SAMPLES_DIR)):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Sample not found")
+    with open(path, "r", encoding="utf-8") as f:
+        return {"content": f.read()}
