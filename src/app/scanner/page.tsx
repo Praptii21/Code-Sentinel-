@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import dynamic from "next/dynamic";
-import { API_BASE_URL } from "@/utils/api";
+import { apiFetch } from "@/utils/api";
 
 const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 
@@ -165,7 +165,7 @@ export default function InteractiveDashboard() {
     setLoadingScan(true); setScanError(null); setResults(null); setFixedVulnIds([]);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/scan`, {
+      const response = await apiFetch("/api/scan", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code: payloadCode }),
       });
@@ -188,7 +188,7 @@ export default function InteractiveDashboard() {
     setLoadingChat(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/process`, {
+      const response = await apiFetch("/process", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: textToSend }),
       });
