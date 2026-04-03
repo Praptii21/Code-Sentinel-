@@ -28,7 +28,9 @@ from slowapi.errors import RateLimitExceeded
 # Initialize Limiter
 limiter = Limiter(key_func=get_remote_address)
 
-# Load .env from project root (parent of backend/)
+# Load from local folder (backend/.env)
+load_dotenv()
+# Fallback/Load from project root (../.env)
 _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
 load_dotenv(_env_path)
 
